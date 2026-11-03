@@ -15,6 +15,12 @@ namespace Microsoft.Data.SqlClient.Parser
 
         public void ProcessSniPacket(PacketHandle packet, uint error)
         {
+            if (s_reproTrace)
+            {
+                uint sz = 0;
+                uint ge = error == 0 && !IsPacketEmpty(packet) ? SniPacketGetData(packet, _inBuff, ref sz) : 0;
+                ReproTrace($"ProcessSniPacket sniError={error} compat={LocalAppContextSwitches.UseCompatibilityProcessSni} getData={ge} dataSize={sz} type=0x{(sz > 0 ? _inBuff[0] : 0):X2} status=0x{(sz > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(sz > 8 ? _inBuff[8] : 0):X2}");
+            }
             if (LocalAppContextSwitches.UseCompatibilityProcessSni)
             {
                 ProcessSniPacketCompat(packet, error);
@@ -23,6 +29,7 @@ namespace Microsoft.Data.SqlClient.Parser
 
             if (error != 0)
             {
+                ReproTrace($"read failed sniError={error} inBytesRead={_inBytesRead} inBytesUsed={_inBytesUsed} partial={(_partialPacket is null ? "none" : _partialPacket.CurrentLength.ToString())}");
                 if ((_parser.State == TdsParserState.Closed) || (_parser.State == TdsParserState.Broken))
                 {
                     // Do nothing with callback if closed or broken and error not 0 - callback can occur
@@ -59,6 +66,7 @@ namespace Microsoft.Data.SqlClient.Parser
                     }
                     getDataError = GetSniPacket(packet, ref dataSize);
                 }
+                ReproTrace($"packet received getDataError={getDataError} dataSize={dataSize} type=0x{(dataSize > 0 ? _inBuff[0] : 0):X2} status=0x{(dataSize > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(dataSize > 8 ? _inBuff[8] : 0):X2}");
 
                 if (getDataError == TdsEnums.SNI_SUCCESS)
                 {

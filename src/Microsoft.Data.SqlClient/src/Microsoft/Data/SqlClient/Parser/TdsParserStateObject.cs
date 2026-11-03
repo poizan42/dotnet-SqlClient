@@ -101,6 +101,27 @@ namespace Microsoft.Data.SqlClient.Parser
         // of very small open, query, close loops.
         private const long CheckConnectionWindow = 50000;
 
+        // PROTOTYPE diagnostics (env-var gated, not for upstream): trace the write/read sequence
+        // on the wire and optionally delay posting the read, to study a lost error response.
+        private static readonly bool s_reproTrace = Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_TRACE") == "1";
+        private static readonly int s_reproReadDelayMs = int.TryParse(Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_READ_DELAY_MS"), out int d) ? d : 0;
+        private static readonly Stopwatch s_reproClock = Stopwatch.StartNew();
+        internal void ReproTrace(string what)
+        {
+            if (s_reproTrace)
+            {
+                Console.Error.WriteLine($"[repro {s_reproClock.Elapsed.TotalMilliseconds,10:F3} ms t{Environment.CurrentManagedThreadId,-3} so{_objectID}] {what}");
+            }
+        }
+        private void ReproDelayBeforeRead()
+        {
+            if (s_reproReadDelayMs > 0)
+            {
+                ReproTrace($"sleeping {s_reproReadDelayMs} ms before posting read");
+                Thread.Sleep(s_reproReadDelayMs);
+            }
+        }
+
         protected readonly TdsParser _parser;                            // TdsParser pointer
         private readonly WeakReference<object> _owner = new(null);   // the owner of this session, used to track when it's been orphaned
         internal SqlDataReader.SharedState _readerState;                    // susbset of SqlDataReader state (if it is the owner) necessary for parsing abandoned results in TDS
@@ -3082,6 +3103,7 @@ namespace Microsoft.Data.SqlClient.Parser
 
             // Async operation completion may be delayed (success pending).
             sniError = WritePacket(packet, sync);
+            ReproTrace($"write returned sniError={sniError} sync={sync} status=0x{_outBuff[1]:X2} (reset bit={(_outBuff[1] & TdsEnums.ST_RESET_CONNECTION) != 0}) bytes={_outBytesUsed}");
 
             if (sniError == TdsEnums.SNI_SUCCESS_IO_PENDING)
             {
@@ -3524,7 +3546,10 @@ namespace Microsoft.Data.SqlClient.Parser
 
                 if (readFromNetwork)
                 {
+                    ReproDelayBeforeRead();
+                    ReproTrace("posting sync read (SniReadSyncOverAsync)");
                     readPacket = ReadSyncOverAsync(GetTimeoutRemaining(), out error);
+                    ReproTrace($"sync read returned sniError={error}");
                 }
                 else
                 {
@@ -3604,6 +3629,7 @@ namespace Microsoft.Data.SqlClient.Parser
             // We live with the above for the time being due to the constraints of the current
             // reliability infrastructure provided by the CLR.
             SqlClientEventSource.Log.TryTraceEvent("TdsParserStateObject.ReadAsyncCallback | Info | State Object Id {0}, Entered ReadAsyncCallback.", _objectID);
+            ReproTrace($"async read callback sniError={error}");
 
             TaskCompletionSource<object> source = _networkPacketTaskSource;
 #if DEBUG
@@ -3970,7 +3996,10 @@ namespace Microsoft.Data.SqlClient.Parser
                         {
                             IncrementPendingCallbacks();
 
+                            ReproDelayBeforeRead();
+                            ReproTrace("posting async read (SniReadAsync)");
                             readPacket = ReadAsync(handle, out error);
+                            ReproTrace($"async read posted sniError={error} (997=pending)");
 
                             if (!(TdsEnums.SNI_SUCCESS == error || TdsEnums.SNI_SUCCESS_IO_PENDING == error))
                             {
