@@ -115,10 +115,90 @@ namespace Microsoft.Data.SqlClient.Parser
         }
         private void ReproDelayBeforeRead()
         {
-            if (s_reproReadDelayMs > 0)
+            if (s_reproReadDelayMs > 0 && !_postingEarlyRead)
             {
                 ReproTrace($"sleeping {s_reproReadDelayMs} ms before posting read");
                 Thread.Sleep(s_reproReadDelayMs);
+            }
+        }
+
+        // PROTOTYPE (fix 1b): post the read for a request that carries the reset bit as soon as
+        // the request has been flushed, instead of waiting for the reader to ask for data. The
+        // server answers a refused reset with error tokens and then aborts the connection, which
+        // discards anything the client has not read yet; a read that is already pending when the
+        // tokens arrive receives them. Gated so the same build can be compared with and without.
+        private static readonly bool s_earlyRead = Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_EARLY_READ") == "1";
+        internal bool _lastWriteCarriedReset;   // set by TdsParser.CheckResetConnection
+        private bool _earlyReadPosted;          // a read posted by PostEarlyRead has not been adopted yet
+
+        private void PostEarlyRead()
+        {
+            if (!s_earlyRead)
+            {
+                return;
+            }
+            if (_earlyReadPosted)
+            {
+                if (_networkPacketTaskSource?.Task.IsCompleted != true)
+                {
+                    ReproTrace("early read still pending from an earlier request; not posting another");
+                    return;
+                }
+                // Completed and never adopted: its data was consumed without going through
+                // TryRun/ReadSni. Discard the stale bookkeeping and post a fresh read.
+                ReproTrace("discarding stale completed early read");
+                _earlyReadPosted = false;
+                _networkPacketTaskSource = null;
+            }
+            if (_parser.State == TdsParserState.Broken || _parser.State == TdsParserState.Closed)
+            {
+                return;
+            }
+            _earlyReadPosted = true;
+            ReproTrace("posting early read right after the reset-carrying request was flushed");
+            _postingEarlyRead = true;   // the injected read delay simulates a slow reader, not this
+            try
+            {
+                ReadSni(new TaskCompletionSource<object>());
+            }
+            finally
+            {
+                _postingEarlyRead = false;
+            }
+        }
+        private bool _postingEarlyRead;
+
+        // Sync callers block until the early read completes; the packet (or the error) is then in
+        // the same place ReadSniSyncOverAsync would have put it. Called from TdsParser.TryRun
+        // before the parser touches the buffer, so the callback thread and the parser thread never
+        // work on the buffer at the same time.
+        internal bool HasEarlyReadPending => _earlyReadPosted;
+        internal void AdoptEarlyReadSync()
+        {
+            if (!_earlyReadPosted)
+            {
+                return;
+            }
+            _earlyReadPosted = false;
+            TaskCompletionSource<object> source = _networkPacketTaskSource;
+            ReproTrace($"adopting early read (sync wait); completed={source?.Task.IsCompleted}");
+            try
+            {
+                source?.Task.Wait();
+            }
+            catch (AggregateException ae) when (ae.InnerException is not null)
+            {
+                throw ae.InnerException;
+            }
+            finally
+            {
+                _networkPacketTaskSource = null;
+            }
+            if (_inBytesRead == 0 || _inBytesUsed >= _inBytesRead)
+            {
+                // No packet arrived: the callback recorded an SNI error. Surface it the way the
+                // sync read path would have.
+                ThrowExceptionAndWarning();
             }
         }
 
@@ -1258,6 +1338,15 @@ namespace Microsoft.Data.SqlClient.Parser
 
         internal Task ExecuteFlush()
         {
+            // PROTOTYPE (fix 1b): if this request carries the deferred reset, post the read
+            // before the final packet goes out. Posting it after the write is not enough in a cold
+            // process: the first execution of the posting code itself takes >1 ms of JIT, and the
+            // server's error-plus-abort arrives within that time.
+            if (s_earlyRead && _parser._fResetConnection && !_fResetConnectionSent && !_cancelled)
+            {
+                PostEarlyRead();
+            }
+
             lock (this)
             {
                 if (_cancelled && 1 == _outputPacketNumber)
@@ -3488,6 +3577,16 @@ namespace Microsoft.Data.SqlClient.Parser
 
             if (_syncOverAsync)
             {
+                if (_earlyReadPosted)
+                {
+                    // Normally TryRun has already adopted it; this covers sync readers that
+                    // reach the network without going through TryRun.
+                    AdoptEarlyReadSync();
+                    if (_inBytesUsed < _inBytesRead)
+                    {
+                        return TdsOperationStatus.Done;
+                    }
+                }
                 ReadSniSyncOverAsync();
                 while (_inBytesRead == 0)
                 {
@@ -3501,7 +3600,7 @@ namespace Microsoft.Data.SqlClient.Parser
                 return TdsOperationStatus.Done;
             }
 
-            ReadSni(new TaskCompletionSource<object>());
+            ReadSni(new TaskCompletionSource<object>());   // adopts a pending early read itself
 
 #if DEBUG
             if (s_failAsyncPends)
@@ -3924,6 +4023,39 @@ namespace Microsoft.Data.SqlClient.Parser
 
         internal void ReadSni(TaskCompletionSource<object> completion)
         {
+            if (_earlyReadPosted && !_postingEarlyRead)
+            {
+                // PROTOTYPE: a read is already pending from PostEarlyRead. Hand its outcome to the
+                // caller's completion source instead of posting a second read.
+                _earlyReadPosted = false;
+                TaskCompletionSource<object> early = _networkPacketTaskSource;
+                _networkPacketTaskSource = completion;
+                Interlocked.MemoryBarrier();
+                ReproTrace($"adopting early read; completed={early?.Task.IsCompleted}");
+                if (early is not null && !ReferenceEquals(early, completion))
+                {
+                    // If the callback has not fired yet it will now complete `completion`
+                    // directly (it reads _networkPacketTaskSource when it runs); if it already
+                    // completed `early`, propagate that.
+                    early.Task.ContinueWith(
+                        static (t, state) =>
+                        {
+                            var target = (TaskCompletionSource<object>)state;
+                            if (t.IsFaulted)
+                            {
+                                target.TrySetException(t.Exception.InnerExceptions);
+                            }
+                            else
+                            {
+                                target.TrySetResult(null);
+                            }
+                        },
+                        completion,
+                        TaskContinuationOptions.ExecuteSynchronously);
+                }
+                return;
+            }
+
             Debug.Assert(_networkPacketTaskSource == null || ((_asyncReadWithoutSnapshot) && (_networkPacketTaskSource.Task.IsCompleted)), "Pending async call or failed to replay snapshot when calling ReadSni");
             _networkPacketTaskSource = completion;
 
@@ -4040,6 +4172,17 @@ namespace Microsoft.Data.SqlClient.Parser
                     {
                         ReleasePacket(readPacket);
                     }
+                }
+                else if (TdsEnums.SNI_SUCCESS_IO_PENDING != error && _postingEarlyRead)
+                {
+                    // PROTOTYPE: the SNI refused to post the early read (seen as 0xFFFFFFFF with
+                    // MARS over named pipes). Nothing was sent yet, so fall back to the normal
+                    // path: the reader will post its own read later.
+                    ReproTrace($"early read refused by SNI (sniError={error}); falling back");
+                    _earlyReadPosted = false;
+                    _networkPacketTaskSource = null;
+                    SetTimeoutStateStopped();
+                    ChangeNetworkPacketTimeout(Timeout.Infinite, Timeout.Infinite);
                 }
                 else if (TdsEnums.SNI_SUCCESS_IO_PENDING != error)
                 { // FAILURE!

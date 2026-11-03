@@ -1929,6 +1929,10 @@ namespace Microsoft.Data.SqlClient.Parser
                             stateObj._outBuff[1] = (byte)(stateObj._outBuff[1] | TdsEnums.ST_RESET_CONNECTION);
                         }
 
+                        // PROTOTYPE: remember that this request carries the reset, so the state
+                        // object can post its read as soon as the request has been flushed.
+                        stateObj._lastWriteCarriedReset = true;
+
                         if (!_fMARS)
                         {
                             _fResetConnection = false; // If not MARS, can turn off flag now.
@@ -2404,6 +2408,13 @@ namespace Microsoft.Data.SqlClient.Parser
             {
                 dataReady = true;
                 return TdsOperationStatus.Done; // Just in case this is called in a loop, expecting data to be returned.
+            }
+
+            // PROTOTYPE (fix 1b): a synchronous parse must wait for the early-posted read before
+            // it looks at the buffer, so the SNI callback and this thread never touch it together.
+            if (stateObj._syncOverAsync && stateObj.HasEarlyReadPending)
+            {
+                stateObj.AdoptEarlyReadSync();
             }
 
             TdsOperationStatus result;
