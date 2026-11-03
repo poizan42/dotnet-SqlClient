@@ -1093,7 +1093,33 @@ namespace Microsoft.Data.SqlClient
 
             CheckThrowSNIException();
 
-            SqlDataReader reader = CompleteAsyncExecuteReader(isInternal, forDescribeParameterEncryption: false);
+            SqlDataReader reader;
+            try
+            {
+                reader = CompleteAsyncExecuteReader(isInternal, forDescribeParameterEncryption: false);
+            }
+            catch (SqlException) when (!isInternal && SqlConnection.ResetRetryEnabled && _activeConnection?.ResetRefusedOnLastRequest == true)
+            {
+                // PROTOTYPE (fix 2b), async: the server refused the pooled connection reset and ran
+                // nothing of the request. CompleteAsyncExecuteReader's finally has already cleaned
+                // up the first attempt. Replace the connection and run the command once more,
+                // synchronously here; a product version would re-issue it asynchronously.
+                if (!TryRecoverFromRefusedReset())
+                {
+                    throw;
+                }
+                return RunExecuteReader(
+                    _lastAsyncCommandBehavior,
+                    RunBehavior.ReturnImmediately,
+                    returnStream: true,
+                    completion: null,
+                    CommandTimeout,
+                    out _,
+                    out _,
+                    asyncWrite: false,
+                    isRetry: true,
+                    endMethod);
+            }
             Debug.Assert(_stateObj is null, "non-null state object in InternalEndExecuteReader");
             return reader;
             // @TODO: CER Exception Handling was removed here (see GH#3581)
@@ -1132,6 +1158,10 @@ namespace Microsoft.Data.SqlClient
             {
                 ValidateCommand(isAsync, method);
                 _activeConnection?.ClearResetRefused();   // PROTOTYPE: a stale marker must not trigger a re-run
+            }
+            if (isAsync)
+            {
+                _lastAsyncCommandBehavior = cmdBehavior;   // PROTOTYPE (fix 2b)
             }
 
             // Only call after validate - requires non-null connection!
@@ -1270,10 +1300,15 @@ namespace Microsoft.Data.SqlClient
                         asyncWrite: asyncWrite && isAsync,
                         isRetry);
                 }
-                catch (SqlException) when (!isRetry && !isAsync && TryRecoverFromRefusedReset())
+                catch (SqlException) when (!isRetry && !isAsync && SqlConnection.ResetRetryEnabled && _activeConnection?.ResetRefusedOnLastRequest == true)
                 {
                     // PROTOTYPE (fix 2b): the server refused the pooled connection reset and ran
-                    // nothing; the connection has been replaced, so run the command once more.
+                    // nothing. Replace the connection (here, after the inner finally blocks have
+                    // run, not in the filter) and run the command once more.
+                    if (!TryRecoverFromRefusedReset())
+                    {
+                        throw;
+                    }
                     return RunExecuteReader(
                         cmdBehavior,
                         runBehavior,

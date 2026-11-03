@@ -241,6 +241,10 @@ namespace Microsoft.Data.SqlClient
         /// </summary>
         private volatile bool _internalEndExecuteInitiated;
 
+        // PROTOTYPE (fix 2b): behavior of the last async reader execution, for the re-run in
+        // InternalEndExecuteReader.
+        private CommandBehavior _lastAsyncCommandBehavior;
+
         private SqlNotificationRequest _notification;
 
         #if NETFRAMEWORK
@@ -2441,13 +2445,6 @@ namespace Microsoft.Data.SqlClient
                                     break;
                                 }
                             }
-
-                            // PROTOTYPE (fix 2b): the server refused the pooled connection reset
-                            // and ran nothing. Replace the connection and re-run once.
-                            if (!shouldRetry && TryRecoverFromRefusedReset())
-                            {
-                                shouldRetry = true;
-                            }
                         }
 
                         if (!shouldRetry)
@@ -2830,7 +2827,6 @@ namespace Microsoft.Data.SqlClient
             // indicates that we should. So, try to read the result of the query before completing
             // the overall task and trigger a retry if appropriate.
             if ((IsColumnEncryptionEnabled && !isRetry && (usedCache || ShouldUseEnclaveBasedWorkflow))
-                || (SqlConnection.ResetRetryEnabled && !isRetry)   // PROTOTYPE (fix 2b): async re-run after a refused reset
                 #if DEBUG
                 || _forceInternalEndQuery
                 #endif

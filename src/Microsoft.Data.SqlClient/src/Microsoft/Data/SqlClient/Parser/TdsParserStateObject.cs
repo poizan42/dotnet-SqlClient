@@ -154,6 +154,12 @@ namespace Microsoft.Data.SqlClient.Parser
             {
                 return;
             }
+            if (_networkPacketTaskSource?.Task.IsCompleted == true)
+            {
+                // Leftover from a finished async operation that kept its completed source
+                // (_asyncReadWithoutSnapshot); ReadSni asserts on it, so clear it first.
+                _networkPacketTaskSource = null;
+            }
             _earlyReadPosted = true;
             ReproTrace("posting early read right after the reset-carrying request was flushed");
             _postingEarlyRead = true;   // the injected read delay simulates a slow reader, not this
