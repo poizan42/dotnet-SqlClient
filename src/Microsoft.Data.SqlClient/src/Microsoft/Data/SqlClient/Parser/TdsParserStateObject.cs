@@ -3141,6 +3141,10 @@ namespace Microsoft.Data.SqlClient.Parser
             _outBuff[7] = 0;                          // window
 
             Task task = null;
+            if (packetNumber == 1)
+            {
+                _lastWriteCarriedReset = false;       // PROTOTYPE: new request; CheckResetConnection sets it if the bit goes out
+            }
             _parser.CheckResetConnection(this);       // HAS SIDE EFFECTS - re-org at a later time if possible
 
             task = WriteSni(canAccumulate);

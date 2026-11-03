@@ -1131,6 +1131,7 @@ namespace Microsoft.Data.SqlClient
             if (!isRetry)
             {
                 ValidateCommand(isAsync, method);
+                _activeConnection?.ClearResetRefused();   // PROTOTYPE: a stale marker must not trigger a re-run
             }
 
             // Only call after validate - requires non-null connection!
@@ -1256,17 +1257,62 @@ namespace Microsoft.Data.SqlClient
             else
             {
                 // @TODO: Reminder, this is where we execute if transparent parameter encryption is not needed.
-                return RunExecuteReaderTds(
-                    cmdBehavior,
-                    runBehavior,
-                    returnStream,
-                    isAsync,
-                    timeout,
-                    out executeTask,
-                    asyncWrite: asyncWrite && isAsync,
-                    isRetry);
+                long firstAttemptStart = ADP.TimerCurrent();
+                try
+                {
+                    return RunExecuteReaderTds(
+                        cmdBehavior,
+                        runBehavior,
+                        returnStream,
+                        isAsync,
+                        timeout,
+                        out executeTask,
+                        asyncWrite: asyncWrite && isAsync,
+                        isRetry);
+                }
+                catch (SqlException) when (!isRetry && !isAsync && TryRecoverFromRefusedReset())
+                {
+                    // PROTOTYPE (fix 2b): the server refused the pooled connection reset and ran
+                    // nothing; the connection has been replaced, so run the command once more.
+                    return RunExecuteReader(
+                        cmdBehavior,
+                        runBehavior,
+                        returnStream,
+                        completion,
+                        TdsParserStaticMethods.GetRemainingTimeout(timeout, firstAttemptStart),
+                        out executeTask,
+                        out usedCache,
+                        asyncWrite: isAsync,
+                        isRetry: true,
+                        method);
+                }
             }
             // @TODO: CER Exception Handling was removed here (see GH#3581)
+        }
+
+        // PROTOTYPE (fix 2b): see SqlConnection.TryReplaceConnectionAfterRefusedReset.
+        private bool TryRecoverFromRefusedReset()
+        {
+            SqlConnection connection = _activeConnection;
+            if (connection is null || !SqlConnection.ResetRetryEnabled || !connection.ResetRefusedOnLastRequest)
+            {
+                return false;
+            }
+            if (_transaction is not null || System.Transactions.Transaction.Current is not null)
+            {
+                // A replacement connection could not take over a transaction; fail as today.
+                connection.ClearResetRefused();
+                return false;
+            }
+            if (!connection.TryReplaceConnectionAfterRefusedReset())
+            {
+                return false;
+            }
+            // The first attempt's async bookkeeping refers to the replaced connection; the re-run
+            // sets it up again from scratch.
+            CachedAsyncState?.ResetAsyncState();
+            connection.AsyncCommandInProgress = false;
+            return true;
         }
 
         // @TODO: This method *needs* to be broken up into separate ones for each type of execution

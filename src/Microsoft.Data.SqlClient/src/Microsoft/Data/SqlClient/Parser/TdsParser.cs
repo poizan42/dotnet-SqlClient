@@ -2514,6 +2514,18 @@ namespace Microsoft.Data.SqlClient.Parser
                                 return result;
                             }
 
+                            // PROTOTYPE (fix 2b): 4021 on a request that carried the connection
+                            // reset, before the server acknowledged that reset, means the server
+                            // refused the reset and executed nothing of the request. Mark the
+                            // outer connection so the command can replace it and re-run once.
+                            if (token == TdsEnums.SQLERROR &&
+                                error.Number == 4021 &&
+                                stateObj._lastWriteCarriedReset &&
+                                SqlConnection.ResetRetryEnabled)
+                            {
+                                _connHandler?.Connection?.MarkResetRefused();
+                            }
+
                             if (token == TdsEnums.SQLINFO && stateObj._accumulateInfoEvents)
                             {
                                 Debug.Assert(error.Class < TdsEnums.MIN_ERROR_CLASS, "INFO with class > TdsEnums.MIN_ERROR_CLASS");
@@ -3372,6 +3384,7 @@ namespace Microsoft.Data.SqlClient.Parser
 
                     case TdsEnums.ENV_TRANSACTIONMANAGERADDRESS:
                     case TdsEnums.ENV_SPRESETCONNECTIONACK:
+                        stateObj._lastWriteCarriedReset = false;   // PROTOTYPE: the server accepted the reset
                         result = TryReadTwoBinaryFields(env, stateObj);
                         if (result != TdsOperationStatus.Done)
                         {

@@ -1314,6 +1314,68 @@ namespace Microsoft.Data.SqlClient
             get => _reconnectCount;
         }
 
+        // PROTOTYPE (fix 2b): transparent recovery when the server refuses to reset a pooled
+        // connection. The parser marks the connection when the first request after checkout is
+        // answered with 4021 before any reset acknowledgement; in that state the server has
+        // executed nothing, so the command replaces the physical connection and re-runs once.
+        internal static readonly bool ResetRetryEnabled =
+            Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_RESET_RETRY") == "1";
+
+        internal bool ResetRefusedOnLastRequest { get; private set; }
+
+        internal void MarkResetRefused()
+        {
+            ResetRefusedOnLastRequest = true;
+            // The class-20 break that follows closes this connection; don't surface that state
+            // change to the user, as connection resiliency does during its reconnect.
+            _suppressStateChangeForReconnection = true;
+            SqlClientEventSource.Log.TryTraceEvent("SqlConnection.MarkResetRefused | Info | Object Id {0}, server refused the pooled connection reset.", ObjectID);
+        }
+
+        internal void ClearResetRefused()
+        {
+            if (ResetRefusedOnLastRequest)
+            {
+                ResetRefusedOnLastRequest = false;
+                _suppressStateChangeForReconnection = false;
+            }
+        }
+
+        // Replaces the inner connection after a refused reset. Returns false when nothing needs
+        // replacing or the replacement failed (the caller then rethrows the original error).
+        internal bool TryReplaceConnectionAfterRefusedReset()
+        {
+            if (!ResetRefusedOnLastRequest)
+            {
+                return false;
+            }
+            ResetRefusedOnLastRequest = false;
+            try
+            {
+                // The break has normally closed this connection already (OnError -> Close), in
+                // which case a plain open gets a fresh pooled connection; if it is still open,
+                // replace the doomed inner connection the way ReconnectAsync does.
+                bool stillOpen = State == ConnectionState.Open;
+                if (!stillOpen && State != ConnectionState.Closed)
+                {
+                    return false;
+                }
+                SqlClientEventSource.Log.TryTraceEvent("SqlConnection.TryReplaceConnectionAfterRefusedReset | Info | Object Id {0}, replacing connection (was {1}).", ObjectID, State);
+                TryOpen(null, forceNewConnection: stillOpen);
+                _reconnectCount = unchecked(_reconnectCount + 1);
+                return true;
+            }
+            catch (Exception e) when (ADP.IsCatchableExceptionType(e))
+            {
+                SqlClientEventSource.Log.TryTraceEvent("SqlConnection.TryReplaceConnectionAfterRefusedReset | Info | Object Id {0}, replacement failed: {1}", ObjectID, e.Message);
+                return false;
+            }
+            finally
+            {
+                _suppressStateChangeForReconnection = false;
+            }
+        }
+
 #if NET
         /// <include file='../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/OnStateChange/*' />
         protected override void OnStateChange(StateChangeEventArgs stateChange)
