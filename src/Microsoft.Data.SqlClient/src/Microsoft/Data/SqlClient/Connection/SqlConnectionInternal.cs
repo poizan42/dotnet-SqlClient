@@ -1240,6 +1240,16 @@ namespace Microsoft.Data.SqlClient.Connection
                     {
                         _currentSessionData._collation = rec._newCollation;
                     }
+
+                    if (rec._newCollation is not null)
+                    {
+                        if (!_fConnectionOpen && _recoverySessionData == null)
+                        {
+                            _loginCollation = rec._newCollation;
+                        }
+
+                        _currentCollation = rec._newCollation;
+                    }
                     break;
 
                 case TdsEnums.ENV_CHARSET:
@@ -2179,6 +2189,20 @@ namespace Microsoft.Data.SqlClient.Connection
                 ResetSessionIsolationLevel(timeout);
             }
 
+            // PROTOTYPE: flush the deferred reset now, on checkout, instead of piggybacking it on
+            // the caller's first request. If the server refuses it (e.g. 4021 / 18456 state 50
+            // after the login database's collation changed), the connection is doomed and marked
+            // so the pool can discard it and vend another; nothing of the caller's has been sent.
+            // A connection bound to a transaction is excluded: a replacement could not take over
+            // its server-side transaction.
+            if (s_validatePooledResetOnCheckout &&
+                _parser._fResetConnection &&
+                EnlistedTransaction is null &&
+                !IsTransactionRoot)
+            {
+                FlushPendingReset(timeout);
+            }
+
             // When we're required to automatically enlist in transactions and there is one we
             // enlist in it. On the other hand, if there isn't a transaction, and we are
             // currently enlisted in one, then we un-enlist from it.
@@ -2223,6 +2247,15 @@ namespace Microsoft.Data.SqlClient.Connection
                 // connection in this case, to prevent odd cases when we go to the wire.
                 if (_asyncCommandCount != 0)
                 {
+                    DoomThisConnection();
+                }
+
+                // PROTOTYPE: the server will refuse to reset this session, so don't pool it.
+                if (s_doomOnLoginDatabaseCollationChange && !IsConnectionDoomed && LoginDatabaseCollationChanged)
+                {
+                    SqlClientEventSource.Log.TryTraceEvent(
+                        "SqlConnectionInternal.Deactivate | Info | Object ID {0}, login database collation changed; not pooling.",
+                        ObjectID);
                     DoomThisConnection();
                 }
 
@@ -4274,6 +4307,8 @@ namespace Microsoft.Data.SqlClient.Connection
             // flag's value stops mattering.
             _isolationLevelDirty = false;
 
+            bool resetWasPending = _parser._fResetConnection;
+
             // Dedicated Synapse pools reject this SET statement with error 104409. Their effective
             // isolation is controlled by the service/database configuration, not this reset.
             if (ADP.IsAzureSynapseDedicatedPoolEndpoint(ConnectionOptions.DataSource))
@@ -4326,10 +4361,83 @@ namespace Microsoft.Data.SqlClient.Connection
                 // try/catch that calls ReturnInternalConnection and rethrows, so the doomed
                 // connection is destroyed rather than pooled and the caller's Open observes the
                 // original error instead of receiving an unusable connection.
+                //
+                // PROTOTYPE: this batch also carried any pending reset, and nothing of the
+                // caller's has been sent, so the pool may replace the connection.
+                PooledResetRefused = s_validatePooledResetOnCheckout && resetWasPending;
                 DoomThisConnection();
                 throw;
             }
         }
+
+        // PROTOTYPE switches; a real change would go through LocalAppContextSwitches.
+        private static readonly bool s_validatePooledResetOnCheckout =
+            AppContext.TryGetSwitch("Switch.Microsoft.Data.SqlClient.Prototype.ValidatePooledResetOnCheckout", out bool v) && v;
+
+        private static readonly bool s_doomOnLoginDatabaseCollationChange =
+            AppContext.TryGetSwitch("Switch.Microsoft.Data.SqlClient.Prototype.DoomOnLoginDatabaseCollationChange", out bool d) && d;
+
+        // PROTOTYPE: sends a no-op batch so the pending reset flag goes out on its own, then reads
+        // the response. Mirrors ResetSessionIsolationLevel's error handling. (An empty batch gets
+        // no response from SQL Server, so it has to be a statement.)
+        private void FlushPendingReset(TimeoutTimer timeout)
+        {
+            if (IsConnectionDoomed)
+            {
+                return;
+            }
+
+            try
+            {
+                long timeoutMilliseconds = 0;
+                if (!timeout.IsInfinite)
+                {
+                    timeoutMilliseconds = timeout.MillisecondsRemaining;
+                    if (timeoutMilliseconds == 0)
+                    {
+                        throw ADP.IsolationLevelResetTimeout();
+                    }
+                }
+
+                ValidateConnectionForExecute(null);
+
+                _parser.TdsExecuteSQLBatchWithMillisecondTimeout(
+                        text: "DECLARE @_ INT;",
+                        timeoutMilliseconds: timeoutMilliseconds,
+                        notificationRequest: null,
+                        stateObj: _parser._physicalStateObj,
+                        sync: true);
+                _parser.Run(RunBehavior.UntilDone, null, null, null, _parser._physicalStateObj);
+
+                if (_parser.State is not TdsParserState.OpenLoggedIn)
+                {
+                    throw ADP.ClosedConnectionError();
+                }
+            }
+            catch (Exception e) when (ADP.IsCatchableExceptionType(e))
+            {
+                SqlClientEventSource.Log.TryTraceEvent(
+                    "SqlConnectionInternal.FlushPendingReset | Info | Object ID {0}, pooled connection reset refused: {1}",
+                    ObjectID, e.Message);
+                PooledResetRefused = true;
+                DoomThisConnection();
+                throw;
+            }
+        }
+
+        // PROTOTYPE: collation the server reported for the login database at login, and the
+        // latest collation ENVCHANGE since.
+        private SqlCollation _loginCollation;
+        private SqlCollation _currentCollation;
+
+        // PROTOTYPE: true when the session is back in its login database but that database's
+        // collation is no longer the one it logged in under, which SQL Server refuses to reset
+        // ("Current collation did not match the database's collation during connection reset").
+        private bool LoginDatabaseCollationChanged =>
+            _loginCollation is not null &&
+            _currentCollation is not null &&
+            !SqlCollation.Equals(_loginCollation, _currentCollation) &&
+            string.Equals(CurrentDatabase, _originalDatabase, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// Decides whether a connection reset must preserve the server-side transaction, i.e.

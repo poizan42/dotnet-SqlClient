@@ -712,6 +712,13 @@ namespace Microsoft.Data.ProviderBase
         internal virtual bool IsConnectionAlive(bool throwOnException = false) => true;
 
         /// <summary>
+        /// Set when activation failed because the server refused the deferred reset of this
+        /// pooled connection. Nothing the caller asked for has been sent at that point, so the
+        /// pool may discard this connection and vend another one instead of failing the Open.
+        /// </summary>
+        internal bool PooledResetRefused { get; private protected set; }
+
+        /// <summary>
         /// Used by DbConnectionFactory to indicate that this object IS NOT part of a connection pool.
         /// </summary>
         internal void MakeNonPooledObject(DbConnection owningObject)

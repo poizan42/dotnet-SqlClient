@@ -964,7 +964,7 @@ namespace Microsoft.Data.SqlClient.ConnectionPool
 #if NETFRAMEWORK
         [SuppressMessage("Microsoft.Reliability", "CA2001:AvoidCallingProblematicMethods")] // copied from Triaged.cs
 #endif
-        private bool TryGetConnection(DbConnection owningObject, uint waitForMultipleObjectsTimeout, bool allowCreate, bool onlyOneCheckConnection, TimeoutTimer timeout, out DbConnectionInternal connection)
+        private bool TryGetConnection(DbConnection owningObject, uint waitForMultipleObjectsTimeout, bool allowCreate, bool onlyOneCheckConnection, TimeoutTimer timeout, out DbConnectionInternal connection, int resetRetriesLeft = 3)
         {
             DbConnectionInternal obj = null;
             Transaction transaction = null;
@@ -1140,7 +1140,18 @@ namespace Microsoft.Data.SqlClient.ConnectionPool
                 // that disconnect unpaired and drive the active-soft-connects gauge negative.
                 // Counted inside this branch so that no connection vended means no soft connect.
                 Metrics.SoftConnectRequest();
-                PrepareConnection(owningObject, obj, transaction, timeout);
+                try
+                {
+                    PrepareConnection(owningObject, obj, transaction, timeout);
+                }
+                catch when (obj.PooledResetRefused && resetRetriesLeft > 0 && !timeout.IsExpired)
+                {
+                    // PROTOTYPE: the server refused to reset this pooled connection before anything
+                    // of the caller's was sent. PrepareConnection has returned it doomed, so it has
+                    // been destroyed; get another one (an idle one or a new physical connection).
+                    SqlClientEventSource.Log.TryPoolerTraceEvent("<prov.DbConnectionPool.GetConnection|RES|CPOOL> {0}, Connection {1}, reset refused by server; discarded, retrying.", Id, obj.ObjectID);
+                    return TryGetConnection(owningObject, waitForMultipleObjectsTimeout, allowCreate, onlyOneCheckConnection, timeout, out connection, resetRetriesLeft - 1);
+                }
             }
 
             connection = obj;
