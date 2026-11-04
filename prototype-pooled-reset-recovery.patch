@@ -1,0 +1,1053 @@
+From 03dad392b7b1e951a9ffb582d99767b0b8a3ed33 Mon Sep 17 00:00:00 2001
+From: kb <kb@dbi-it.dk>
+Date: Tue, 3 Nov 2026 14:09:05 +0100
+Subject: [PATCH 1/5] PROTOTYPE: recover from a pooled connection whose reset
+ the server refuses
+
+Two opt-in AppContext switches, for evaluation only (not for upstream as is):
+- Switch.Microsoft.Data.SqlClient.Prototype.ValidatePooledResetOnCheckout:
+  flush the deferred reset with a no-op batch during Activate; on failure
+  doom the connection and let WaitHandleDbConnectionPool get another.
+- Switch.Microsoft.Data.SqlClient.Prototype.DoomOnLoginDatabaseCollationChange:
+  don't pool a session whose login database's collation changed (seen via
+  ENV_COLLATION), since SQL Server will refuse to reset it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Data/ProviderBase/DbConnectionInternal.cs |   7 ++
+ .../Connection/SqlConnectionInternal.cs       | 108 ++++++++++++++++++
+ .../WaitHandleDbConnectionPool.cs             |  15 ++-
+ 3 files changed, 128 insertions(+), 2 deletions(-)
+
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/ProviderBase/DbConnectionInternal.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/ProviderBase/DbConnectionInternal.cs
+index 3d7217739..e366d7475 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/ProviderBase/DbConnectionInternal.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/ProviderBase/DbConnectionInternal.cs
+@@ -711,6 +711,13 @@ namespace Microsoft.Data.ProviderBase
+         /// </returns>
+         internal virtual bool IsConnectionAlive(bool throwOnException = false) => true;
+ 
++        /// <summary>
++        /// Set when activation failed because the server refused the deferred reset of this
++        /// pooled connection. Nothing the caller asked for has been sent at that point, so the
++        /// pool may discard this connection and vend another one instead of failing the Open.
++        /// </summary>
++        internal bool PooledResetRefused { get; private protected set; }
++
+         /// <summary>
+         /// Used by DbConnectionFactory to indicate that this object IS NOT part of a connection pool.
+         /// </summary>
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Connection/SqlConnectionInternal.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Connection/SqlConnectionInternal.cs
+index 6e8f94b7c..6c825ec1e 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Connection/SqlConnectionInternal.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Connection/SqlConnectionInternal.cs
+@@ -1240,6 +1240,16 @@ namespace Microsoft.Data.SqlClient.Connection
+                     {
+                         _currentSessionData._collation = rec._newCollation;
+                     }
++
++                    if (rec._newCollation is not null)
++                    {
++                        if (!_fConnectionOpen && _recoverySessionData == null)
++                        {
++                            _loginCollation = rec._newCollation;
++                        }
++
++                        _currentCollation = rec._newCollation;
++                    }
+                     break;
+ 
+                 case TdsEnums.ENV_CHARSET:
+@@ -2179,6 +2189,20 @@ namespace Microsoft.Data.SqlClient.Connection
+                 ResetSessionIsolationLevel(timeout);
+             }
+ 
++            // PROTOTYPE: flush the deferred reset now, on checkout, instead of piggybacking it on
++            // the caller's first request. If the server refuses it (e.g. 4021 / 18456 state 50
++            // after the login database's collation changed), the connection is doomed and marked
++            // so the pool can discard it and vend another; nothing of the caller's has been sent.
++            // A connection bound to a transaction is excluded: a replacement could not take over
++            // its server-side transaction.
++            if (s_validatePooledResetOnCheckout &&
++                _parser._fResetConnection &&
++                EnlistedTransaction is null &&
++                !IsTransactionRoot)
++            {
++                FlushPendingReset(timeout);
++            }
++
+             // When we're required to automatically enlist in transactions and there is one we
+             // enlist in it. On the other hand, if there isn't a transaction, and we are
+             // currently enlisted in one, then we un-enlist from it.
+@@ -2226,6 +2250,15 @@ namespace Microsoft.Data.SqlClient.Connection
+                     DoomThisConnection();
+                 }
+ 
++                // PROTOTYPE: the server will refuse to reset this session, so don't pool it.
++                if (s_doomOnLoginDatabaseCollationChange && !IsConnectionDoomed && LoginDatabaseCollationChanged)
++                {
++                    SqlClientEventSource.Log.TryTraceEvent(
++                        "SqlConnectionInternal.Deactivate | Info | Object ID {0}, login database collation changed; not pooling.",
++                        ObjectID);
++                    DoomThisConnection();
++                }
++
+                 // If we're deactivating with a delegated transaction, we should not be cleaning up
+                 // the parser just yet, that will cause our transaction to be rolled back and the
+                 // connection to be reset. We'll get called again once the delegated transaction is
+@@ -4274,6 +4307,8 @@ namespace Microsoft.Data.SqlClient.Connection
+             // flag's value stops mattering.
+             _isolationLevelDirty = false;
+ 
++            bool resetWasPending = _parser._fResetConnection;
++
+             // Dedicated Synapse pools reject this SET statement with error 104409. Their effective
+             // isolation is controlled by the service/database configuration, not this reset.
+             if (ADP.IsAzureSynapseDedicatedPoolEndpoint(ConnectionOptions.DataSource))
+@@ -4326,11 +4361,84 @@ namespace Microsoft.Data.SqlClient.Connection
+                 // try/catch that calls ReturnInternalConnection and rethrows, so the doomed
+                 // connection is destroyed rather than pooled and the caller's Open observes the
+                 // original error instead of receiving an unusable connection.
++                //
++                // PROTOTYPE: this batch also carried any pending reset, and nothing of the
++                // caller's has been sent, so the pool may replace the connection.
++                PooledResetRefused = s_validatePooledResetOnCheckout && resetWasPending;
+                 DoomThisConnection();
+                 throw;
+             }
+         }
+ 
++        // PROTOTYPE switches; a real change would go through LocalAppContextSwitches.
++        private static readonly bool s_validatePooledResetOnCheckout =
++            AppContext.TryGetSwitch("Switch.Microsoft.Data.SqlClient.Prototype.ValidatePooledResetOnCheckout", out bool v) && v;
++
++        private static readonly bool s_doomOnLoginDatabaseCollationChange =
++            AppContext.TryGetSwitch("Switch.Microsoft.Data.SqlClient.Prototype.DoomOnLoginDatabaseCollationChange", out bool d) && d;
++
++        // PROTOTYPE: sends a no-op batch so the pending reset flag goes out on its own, then reads
++        // the response. Mirrors ResetSessionIsolationLevel's error handling. (An empty batch gets
++        // no response from SQL Server, so it has to be a statement.)
++        private void FlushPendingReset(TimeoutTimer timeout)
++        {
++            if (IsConnectionDoomed)
++            {
++                return;
++            }
++
++            try
++            {
++                long timeoutMilliseconds = 0;
++                if (!timeout.IsInfinite)
++                {
++                    timeoutMilliseconds = timeout.MillisecondsRemaining;
++                    if (timeoutMilliseconds == 0)
++                    {
++                        throw ADP.IsolationLevelResetTimeout();
++                    }
++                }
++
++                ValidateConnectionForExecute(null);
++
++                _parser.TdsExecuteSQLBatchWithMillisecondTimeout(
++                        text: "DECLARE @_ INT;",
++                        timeoutMilliseconds: timeoutMilliseconds,
++                        notificationRequest: null,
++                        stateObj: _parser._physicalStateObj,
++                        sync: true);
++                _parser.Run(RunBehavior.UntilDone, null, null, null, _parser._physicalStateObj);
++
++                if (_parser.State is not TdsParserState.OpenLoggedIn)
++                {
++                    throw ADP.ClosedConnectionError();
++                }
++            }
++            catch (Exception e) when (ADP.IsCatchableExceptionType(e))
++            {
++                SqlClientEventSource.Log.TryTraceEvent(
++                    "SqlConnectionInternal.FlushPendingReset | Info | Object ID {0}, pooled connection reset refused: {1}",
++                    ObjectID, e.Message);
++                PooledResetRefused = true;
++                DoomThisConnection();
++                throw;
++            }
++        }
++
++        // PROTOTYPE: collation the server reported for the login database at login, and the
++        // latest collation ENVCHANGE since.
++        private SqlCollation _loginCollation;
++        private SqlCollation _currentCollation;
++
++        // PROTOTYPE: true when the session is back in its login database but that database's
++        // collation is no longer the one it logged in under, which SQL Server refuses to reset
++        // ("Current collation did not match the database's collation during connection reset").
++        private bool LoginDatabaseCollationChanged =>
++            _loginCollation is not null &&
++            _currentCollation is not null &&
++            !SqlCollation.Equals(_loginCollation, _currentCollation) &&
++            string.Equals(CurrentDatabase, _originalDatabase, StringComparison.OrdinalIgnoreCase);
++
+         /// <summary>
+         /// Decides whether a connection reset must preserve the server-side transaction, i.e.
+         /// whether <c>ST_RESET_CONNECTION_PRESERVE_TRANSACTION</c> should be sent instead of a
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/ConnectionPool/WaitHandleDbConnectionPool.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/ConnectionPool/WaitHandleDbConnectionPool.cs
+index c628c0993..0420d5e1e 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/ConnectionPool/WaitHandleDbConnectionPool.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/ConnectionPool/WaitHandleDbConnectionPool.cs
+@@ -964,7 +964,7 @@ namespace Microsoft.Data.SqlClient.ConnectionPool
+ #if NETFRAMEWORK
+         [SuppressMessage("Microsoft.Reliability", "CA2001:AvoidCallingProblematicMethods")] // copied from Triaged.cs
+ #endif
+-        private bool TryGetConnection(DbConnection owningObject, uint waitForMultipleObjectsTimeout, bool allowCreate, bool onlyOneCheckConnection, TimeoutTimer timeout, out DbConnectionInternal connection)
++        private bool TryGetConnection(DbConnection owningObject, uint waitForMultipleObjectsTimeout, bool allowCreate, bool onlyOneCheckConnection, TimeoutTimer timeout, out DbConnectionInternal connection, int resetRetriesLeft = 3)
+         {
+             DbConnectionInternal obj = null;
+             Transaction transaction = null;
+@@ -1140,7 +1140,18 @@ namespace Microsoft.Data.SqlClient.ConnectionPool
+                 // that disconnect unpaired and drive the active-soft-connects gauge negative.
+                 // Counted inside this branch so that no connection vended means no soft connect.
+                 Metrics.SoftConnectRequest();
+-                PrepareConnection(owningObject, obj, transaction, timeout);
++                try
++                {
++                    PrepareConnection(owningObject, obj, transaction, timeout);
++                }
++                catch when (obj.PooledResetRefused && resetRetriesLeft > 0 && !timeout.IsExpired)
++                {
++                    // PROTOTYPE: the server refused to reset this pooled connection before anything
++                    // of the caller's was sent. PrepareConnection has returned it doomed, so it has
++                    // been destroyed; get another one (an idle one or a new physical connection).
++                    SqlClientEventSource.Log.TryPoolerTraceEvent("<prov.DbConnectionPool.GetConnection|RES|CPOOL> {0}, Connection {1}, reset refused by server; discarded, retrying.", Id, obj.ObjectID);
++                    return TryGetConnection(owningObject, waitForMultipleObjectsTimeout, allowCreate, onlyOneCheckConnection, timeout, out connection, resetRetriesLeft - 1);
++                }
+             }
+ 
+             connection = obj;
+-- 
+2.55.0.windows.5
+
+
+From c1aee41bc463d6c1de94ac989a36818ea801025d Mon Sep 17 00:00:00 2001
+From: kb <kb@dbi-it.dk>
+Date: Tue, 3 Nov 2026 17:52:24 +0100
+Subject: [PATCH 2/5] PROTOTYPE: env-var gated wire trace and read-delay
+ injection in TdsParserStateObject
+
+SQLCLIENT_REPRO_TRACE=1 logs each write/read with SNI error, packet size and
+first token; SQLCLIENT_REPRO_READ_DELAY_MS=n sleeps before posting each read.
+Used to show that the error tokens for a refused pooled reset are lost when
+the read is posted after the server's abortive disconnect.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../TdsParserStateObject.Multiplexer.cs       |  8 +++++
+ .../SqlClient/Parser/TdsParserStateObject.cs  | 29 +++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
+index 327d507c8..ae717a504 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
+@@ -15,6 +15,12 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+         public void ProcessSniPacket(PacketHandle packet, uint error)
+         {
++            if (s_reproTrace)
++            {
++                uint sz = 0;
++                uint ge = error == 0 && !IsPacketEmpty(packet) ? SniPacketGetData(packet, _inBuff, ref sz) : 0;
++                ReproTrace($"ProcessSniPacket sniError={error} compat={LocalAppContextSwitches.UseCompatibilityProcessSni} getData={ge} dataSize={sz} type=0x{(sz > 0 ? _inBuff[0] : 0):X2} status=0x{(sz > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(sz > 8 ? _inBuff[8] : 0):X2}");
++            }
+             if (LocalAppContextSwitches.UseCompatibilityProcessSni)
+             {
+                 ProcessSniPacketCompat(packet, error);
+@@ -23,6 +29,7 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+             if (error != 0)
+             {
++                ReproTrace($"read failed sniError={error} inBytesRead={_inBytesRead} inBytesUsed={_inBytesUsed} partial={(_partialPacket is null ? "none" : _partialPacket.CurrentLength.ToString())}");
+                 if ((_parser.State == TdsParserState.Closed) || (_parser.State == TdsParserState.Broken))
+                 {
+                     // Do nothing with callback if closed or broken and error not 0 - callback can occur
+@@ -59,6 +66,7 @@ namespace Microsoft.Data.SqlClient.Parser
+                     }
+                     getDataError = GetSniPacket(packet, ref dataSize);
+                 }
++                ReproTrace($"packet received getDataError={getDataError} dataSize={dataSize} type=0x{(dataSize > 0 ? _inBuff[0] : 0):X2} status=0x{(dataSize > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(dataSize > 8 ? _inBuff[8] : 0):X2}");
+ 
+                 if (getDataError == TdsEnums.SNI_SUCCESS)
+                 {
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+index 59949d28a..cdd4a5a02 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+@@ -101,6 +101,27 @@ namespace Microsoft.Data.SqlClient.Parser
+         // of very small open, query, close loops.
+         private const long CheckConnectionWindow = 50000;
+ 
++        // PROTOTYPE diagnostics (env-var gated, not for upstream): trace the write/read sequence
++        // on the wire and optionally delay posting the read, to study a lost error response.
++        private static readonly bool s_reproTrace = Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_TRACE") == "1";
++        private static readonly int s_reproReadDelayMs = int.TryParse(Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_READ_DELAY_MS"), out int d) ? d : 0;
++        private static readonly Stopwatch s_reproClock = Stopwatch.StartNew();
++        internal void ReproTrace(string what)
++        {
++            if (s_reproTrace)
++            {
++                Console.Error.WriteLine($"[repro {s_reproClock.Elapsed.TotalMilliseconds,10:F3} ms t{Environment.CurrentManagedThreadId,-3} so{_objectID}] {what}");
++            }
++        }
++        private void ReproDelayBeforeRead()
++        {
++            if (s_reproReadDelayMs > 0)
++            {
++                ReproTrace($"sleeping {s_reproReadDelayMs} ms before posting read");
++                Thread.Sleep(s_reproReadDelayMs);
++            }
++        }
++
+         protected readonly TdsParser _parser;                            // TdsParser pointer
+         private readonly WeakReference<object> _owner = new(null);   // the owner of this session, used to track when it's been orphaned
+         internal SqlDataReader.SharedState _readerState;                    // susbset of SqlDataReader state (if it is the owner) necessary for parsing abandoned results in TDS
+@@ -3082,6 +3103,7 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+             // Async operation completion may be delayed (success pending).
+             sniError = WritePacket(packet, sync);
++            ReproTrace($"write returned sniError={sniError} sync={sync} status=0x{_outBuff[1]:X2} (reset bit={(_outBuff[1] & TdsEnums.ST_RESET_CONNECTION) != 0}) bytes={_outBytesUsed}");
+ 
+             if (sniError == TdsEnums.SNI_SUCCESS_IO_PENDING)
+             {
+@@ -3524,7 +3546,10 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+                 if (readFromNetwork)
+                 {
++                    ReproDelayBeforeRead();
++                    ReproTrace("posting sync read (SniReadSyncOverAsync)");
+                     readPacket = ReadSyncOverAsync(GetTimeoutRemaining(), out error);
++                    ReproTrace($"sync read returned sniError={error}");
+                 }
+                 else
+                 {
+@@ -3604,6 +3629,7 @@ namespace Microsoft.Data.SqlClient.Parser
+             // We live with the above for the time being due to the constraints of the current
+             // reliability infrastructure provided by the CLR.
+             SqlClientEventSource.Log.TryTraceEvent("TdsParserStateObject.ReadAsyncCallback | Info | State Object Id {0}, Entered ReadAsyncCallback.", _objectID);
++            ReproTrace($"async read callback sniError={error}");
+ 
+             TaskCompletionSource<object> source = _networkPacketTaskSource;
+ #if DEBUG
+@@ -3970,7 +3996,10 @@ namespace Microsoft.Data.SqlClient.Parser
+                         {
+                             IncrementPendingCallbacks();
+ 
++                            ReproDelayBeforeRead();
++                            ReproTrace("posting async read (SniReadAsync)");
+                             readPacket = ReadAsync(handle, out error);
++                            ReproTrace($"async read posted sniError={error} (997=pending)");
+ 
+                             if (!(TdsEnums.SNI_SUCCESS == error || TdsEnums.SNI_SUCCESS_IO_PENDING == error))
+                             {
+-- 
+2.55.0.windows.5
+
+
+From b3df90f3ce00bb1adde75cfecf69d49d12f0021d Mon Sep 17 00:00:00 2001
+From: kb <kb@dbi-it.dk>
+Date: Tue, 3 Nov 2026 21:20:38 +0100
+Subject: [PATCH 3/5] PROTOTYPE: post the read before a reset-carrying request
+ is sent (fix 1b)
+
+Opt-in via SQLCLIENT_REPRO_EARLY_READ=1. When the request about to be flushed
+carries the deferred connection reset, TdsParserStateObject.ExecuteFlush posts
+the read (ReadSni) before writing the final packet. ReadSni adopts a pending
+early read instead of posting a second one; a synchronous TryRun waits for it
+before touching the buffer; a read the SNI refuses to post falls back to the
+normal path; a completed early read nobody adopted is discarded.
+
+With this, a refused reset arrives as error 4021 in every tested case (cold
+process, sync and async, MARS on and off, named pipes and TCP, delayed reader)
+instead of a transport error with the tokens lost.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../Data/SqlClient/Parser/TdsParser.cs        |  11 ++
+ .../SqlClient/Parser/TdsParserStateObject.cs  | 147 +++++++++++++++++-
+ 2 files changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
+index a249867a1..97fddc34b 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
+@@ -1929,6 +1929,10 @@ namespace Microsoft.Data.SqlClient.Parser
+                             stateObj._outBuff[1] = (byte)(stateObj._outBuff[1] | TdsEnums.ST_RESET_CONNECTION);
+                         }
+ 
++                        // PROTOTYPE: remember that this request carries the reset, so the state
++                        // object can post its read as soon as the request has been flushed.
++                        stateObj._lastWriteCarriedReset = true;
++
+                         if (!_fMARS)
+                         {
+                             _fResetConnection = false; // If not MARS, can turn off flag now.
+@@ -2406,6 +2410,13 @@ namespace Microsoft.Data.SqlClient.Parser
+                 return TdsOperationStatus.Done; // Just in case this is called in a loop, expecting data to be returned.
+             }
+ 
++            // PROTOTYPE (fix 1b): a synchronous parse must wait for the early-posted read before
++            // it looks at the buffer, so the SNI callback and this thread never touch it together.
++            if (stateObj._syncOverAsync && stateObj.HasEarlyReadPending)
++            {
++                stateObj.AdoptEarlyReadSync();
++            }
++
+             TdsOperationStatus result;
+             dataReady = false;
+ 
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+index cdd4a5a02..6aaf7c9fc 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+@@ -115,13 +115,93 @@ namespace Microsoft.Data.SqlClient.Parser
+         }
+         private void ReproDelayBeforeRead()
+         {
+-            if (s_reproReadDelayMs > 0)
++            if (s_reproReadDelayMs > 0 && !_postingEarlyRead)
+             {
+                 ReproTrace($"sleeping {s_reproReadDelayMs} ms before posting read");
+                 Thread.Sleep(s_reproReadDelayMs);
+             }
+         }
+ 
++        // PROTOTYPE (fix 1b): post the read for a request that carries the reset bit as soon as
++        // the request has been flushed, instead of waiting for the reader to ask for data. The
++        // server answers a refused reset with error tokens and then aborts the connection, which
++        // discards anything the client has not read yet; a read that is already pending when the
++        // tokens arrive receives them. Gated so the same build can be compared with and without.
++        private static readonly bool s_earlyRead = Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_EARLY_READ") == "1";
++        internal bool _lastWriteCarriedReset;   // set by TdsParser.CheckResetConnection
++        private bool _earlyReadPosted;          // a read posted by PostEarlyRead has not been adopted yet
++
++        private void PostEarlyRead()
++        {
++            if (!s_earlyRead)
++            {
++                return;
++            }
++            if (_earlyReadPosted)
++            {
++                if (_networkPacketTaskSource?.Task.IsCompleted != true)
++                {
++                    ReproTrace("early read still pending from an earlier request; not posting another");
++                    return;
++                }
++                // Completed and never adopted: its data was consumed without going through
++                // TryRun/ReadSni. Discard the stale bookkeeping and post a fresh read.
++                ReproTrace("discarding stale completed early read");
++                _earlyReadPosted = false;
++                _networkPacketTaskSource = null;
++            }
++            if (_parser.State == TdsParserState.Broken || _parser.State == TdsParserState.Closed)
++            {
++                return;
++            }
++            _earlyReadPosted = true;
++            ReproTrace("posting early read right after the reset-carrying request was flushed");
++            _postingEarlyRead = true;   // the injected read delay simulates a slow reader, not this
++            try
++            {
++                ReadSni(new TaskCompletionSource<object>());
++            }
++            finally
++            {
++                _postingEarlyRead = false;
++            }
++        }
++        private bool _postingEarlyRead;
++
++        // Sync callers block until the early read completes; the packet (or the error) is then in
++        // the same place ReadSniSyncOverAsync would have put it. Called from TdsParser.TryRun
++        // before the parser touches the buffer, so the callback thread and the parser thread never
++        // work on the buffer at the same time.
++        internal bool HasEarlyReadPending => _earlyReadPosted;
++        internal void AdoptEarlyReadSync()
++        {
++            if (!_earlyReadPosted)
++            {
++                return;
++            }
++            _earlyReadPosted = false;
++            TaskCompletionSource<object> source = _networkPacketTaskSource;
++            ReproTrace($"adopting early read (sync wait); completed={source?.Task.IsCompleted}");
++            try
++            {
++                source?.Task.Wait();
++            }
++            catch (AggregateException ae) when (ae.InnerException is not null)
++            {
++                throw ae.InnerException;
++            }
++            finally
++            {
++                _networkPacketTaskSource = null;
++            }
++            if (_inBytesRead == 0 || _inBytesUsed >= _inBytesRead)
++            {
++                // No packet arrived: the callback recorded an SNI error. Surface it the way the
++                // sync read path would have.
++                ThrowExceptionAndWarning();
++            }
++        }
++
+         protected readonly TdsParser _parser;                            // TdsParser pointer
+         private readonly WeakReference<object> _owner = new(null);   // the owner of this session, used to track when it's been orphaned
+         internal SqlDataReader.SharedState _readerState;                    // susbset of SqlDataReader state (if it is the owner) necessary for parsing abandoned results in TDS
+@@ -1258,6 +1338,15 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+         internal Task ExecuteFlush()
+         {
++            // PROTOTYPE (fix 1b): if this request carries the deferred reset, post the read
++            // before the final packet goes out. Posting it after the write is not enough in a cold
++            // process: the first execution of the posting code itself takes >1 ms of JIT, and the
++            // server's error-plus-abort arrives within that time.
++            if (s_earlyRead && _parser._fResetConnection && !_fResetConnectionSent && !_cancelled)
++            {
++                PostEarlyRead();
++            }
++
+             lock (this)
+             {
+                 if (_cancelled && 1 == _outputPacketNumber)
+@@ -3488,6 +3577,16 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+             if (_syncOverAsync)
+             {
++                if (_earlyReadPosted)
++                {
++                    // Normally TryRun has already adopted it; this covers sync readers that
++                    // reach the network without going through TryRun.
++                    AdoptEarlyReadSync();
++                    if (_inBytesUsed < _inBytesRead)
++                    {
++                        return TdsOperationStatus.Done;
++                    }
++                }
+                 ReadSniSyncOverAsync();
+                 while (_inBytesRead == 0)
+                 {
+@@ -3501,7 +3600,7 @@ namespace Microsoft.Data.SqlClient.Parser
+                 return TdsOperationStatus.Done;
+             }
+ 
+-            ReadSni(new TaskCompletionSource<object>());
++            ReadSni(new TaskCompletionSource<object>());   // adopts a pending early read itself
+ 
+ #if DEBUG
+             if (s_failAsyncPends)
+@@ -3924,6 +4023,39 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+         internal void ReadSni(TaskCompletionSource<object> completion)
+         {
++            if (_earlyReadPosted && !_postingEarlyRead)
++            {
++                // PROTOTYPE: a read is already pending from PostEarlyRead. Hand its outcome to the
++                // caller's completion source instead of posting a second read.
++                _earlyReadPosted = false;
++                TaskCompletionSource<object> early = _networkPacketTaskSource;
++                _networkPacketTaskSource = completion;
++                Interlocked.MemoryBarrier();
++                ReproTrace($"adopting early read; completed={early?.Task.IsCompleted}");
++                if (early is not null && !ReferenceEquals(early, completion))
++                {
++                    // If the callback has not fired yet it will now complete `completion`
++                    // directly (it reads _networkPacketTaskSource when it runs); if it already
++                    // completed `early`, propagate that.
++                    early.Task.ContinueWith(
++                        static (t, state) =>
++                        {
++                            var target = (TaskCompletionSource<object>)state;
++                            if (t.IsFaulted)
++                            {
++                                target.TrySetException(t.Exception.InnerExceptions);
++                            }
++                            else
++                            {
++                                target.TrySetResult(null);
++                            }
++                        },
++                        completion,
++                        TaskContinuationOptions.ExecuteSynchronously);
++                }
++                return;
++            }
++
+             Debug.Assert(_networkPacketTaskSource == null || ((_asyncReadWithoutSnapshot) && (_networkPacketTaskSource.Task.IsCompleted)), "Pending async call or failed to replay snapshot when calling ReadSni");
+             _networkPacketTaskSource = completion;
+ 
+@@ -4041,6 +4173,17 @@ namespace Microsoft.Data.SqlClient.Parser
+                         ReleasePacket(readPacket);
+                     }
+                 }
++                else if (TdsEnums.SNI_SUCCESS_IO_PENDING != error && _postingEarlyRead)
++                {
++                    // PROTOTYPE: the SNI refused to post the early read (seen as 0xFFFFFFFF with
++                    // MARS over named pipes). Nothing was sent yet, so fall back to the normal
++                    // path: the reader will post its own read later.
++                    ReproTrace($"early read refused by SNI (sniError={error}); falling back");
++                    _earlyReadPosted = false;
++                    _networkPacketTaskSource = null;
++                    SetTimeoutStateStopped();
++                    ChangeNetworkPacketTimeout(Timeout.Infinite, Timeout.Infinite);
++                }
+                 else if (TdsEnums.SNI_SUCCESS_IO_PENDING != error)
+                 { // FAILURE!
+                     Debug.Assert(IsPacketEmpty(readPacket), "unexpected readPacket without corresponding SNIPacketRelease");
+-- 
+2.55.0.windows.5
+
+
+From 9472e48f6f74339d1510f65f7308b0fc6cd9ee20 Mon Sep 17 00:00:00 2001
+From: kb <kb@dbi-it.dk>
+Date: Tue, 3 Nov 2026 22:06:49 +0100
+Subject: [PATCH 4/5] PROTOTYPE: replace the connection and re-run once when
+ the server refuses the reset (fix 2b)
+
+Opt-in via SQLCLIENT_REPRO_RESET_RETRY=1. TdsParser marks the outer
+SqlConnection when ERROR 4021 arrives on a request that carried the connection
+reset bit before the server acknowledged the reset; in that state the server
+has executed nothing of the request. SqlCommand.RunExecuteReader (sync) and
+the internal-end-and-retry continuation (async) then replace the physical
+connection (plain re-open after the class-20 break closed it, with the state
+change suppressed as connection resiliency does) and re-run the command once.
+Not when a local or ambient transaction is active. ExecuteNonQuery,
+BeginTransaction and bulk copy paths are not hooked.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../Data/SqlClient/Parser/TdsParser.cs        | 13 ++++
+ .../SqlClient/Parser/TdsParserStateObject.cs  |  4 ++
+ .../Data/SqlClient/SqlCommand.Reader.cs       | 64 ++++++++++++++++---
+ .../Microsoft/Data/SqlClient/SqlCommand.cs    |  8 +++
+ .../Microsoft/Data/SqlClient/SqlConnection.cs | 62 ++++++++++++++++++
+ 5 files changed, 142 insertions(+), 9 deletions(-)
+
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
+index 97fddc34b..42e92657e 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParser.cs
+@@ -2514,6 +2514,18 @@ namespace Microsoft.Data.SqlClient.Parser
+                                 return result;
+                             }
+ 
++                            // PROTOTYPE (fix 2b): 4021 on a request that carried the connection
++                            // reset, before the server acknowledged that reset, means the server
++                            // refused the reset and executed nothing of the request. Mark the
++                            // outer connection so the command can replace it and re-run once.
++                            if (token == TdsEnums.SQLERROR &&
++                                error.Number == 4021 &&
++                                stateObj._lastWriteCarriedReset &&
++                                SqlConnection.ResetRetryEnabled)
++                            {
++                                _connHandler?.Connection?.MarkResetRefused();
++                            }
++
+                             if (token == TdsEnums.SQLINFO && stateObj._accumulateInfoEvents)
+                             {
+                                 Debug.Assert(error.Class < TdsEnums.MIN_ERROR_CLASS, "INFO with class > TdsEnums.MIN_ERROR_CLASS");
+@@ -3372,6 +3384,7 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+                     case TdsEnums.ENV_TRANSACTIONMANAGERADDRESS:
+                     case TdsEnums.ENV_SPRESETCONNECTIONACK:
++                        stateObj._lastWriteCarriedReset = false;   // PROTOTYPE: the server accepted the reset
+                         result = TryReadTwoBinaryFields(env, stateObj);
+                         if (result != TdsOperationStatus.Done)
+                         {
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+index 6aaf7c9fc..207ffade1 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+@@ -3141,6 +3141,10 @@ namespace Microsoft.Data.SqlClient.Parser
+             _outBuff[7] = 0;                          // window
+ 
+             Task task = null;
++            if (packetNumber == 1)
++            {
++                _lastWriteCarriedReset = false;       // PROTOTYPE: new request; CheckResetConnection sets it if the bit goes out
++            }
+             _parser.CheckResetConnection(this);       // HAS SIDE EFFECTS - re-org at a later time if possible
+ 
+             task = WriteSni(canAccumulate);
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
+index 7d054f593..abe775b00 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
+@@ -1131,6 +1131,7 @@ namespace Microsoft.Data.SqlClient
+             if (!isRetry)
+             {
+                 ValidateCommand(isAsync, method);
++                _activeConnection?.ClearResetRefused();   // PROTOTYPE: a stale marker must not trigger a re-run
+             }
+ 
+             // Only call after validate - requires non-null connection!
+@@ -1256,19 +1257,64 @@ namespace Microsoft.Data.SqlClient
+             else
+             {
+                 // @TODO: Reminder, this is where we execute if transparent parameter encryption is not needed.
+-                return RunExecuteReaderTds(
+-                    cmdBehavior,
+-                    runBehavior,
+-                    returnStream,
+-                    isAsync,
+-                    timeout,
+-                    out executeTask,
+-                    asyncWrite: asyncWrite && isAsync,
+-                    isRetry);
++                long firstAttemptStart = ADP.TimerCurrent();
++                try
++                {
++                    return RunExecuteReaderTds(
++                        cmdBehavior,
++                        runBehavior,
++                        returnStream,
++                        isAsync,
++                        timeout,
++                        out executeTask,
++                        asyncWrite: asyncWrite && isAsync,
++                        isRetry);
++                }
++                catch (SqlException) when (!isRetry && !isAsync && TryRecoverFromRefusedReset())
++                {
++                    // PROTOTYPE (fix 2b): the server refused the pooled connection reset and ran
++                    // nothing; the connection has been replaced, so run the command once more.
++                    return RunExecuteReader(
++                        cmdBehavior,
++                        runBehavior,
++                        returnStream,
++                        completion,
++                        TdsParserStaticMethods.GetRemainingTimeout(timeout, firstAttemptStart),
++                        out executeTask,
++                        out usedCache,
++                        asyncWrite: isAsync,
++                        isRetry: true,
++                        method);
++                }
+             }
+             // @TODO: CER Exception Handling was removed here (see GH#3581)
+         }
+ 
++        // PROTOTYPE (fix 2b): see SqlConnection.TryReplaceConnectionAfterRefusedReset.
++        private bool TryRecoverFromRefusedReset()
++        {
++            SqlConnection connection = _activeConnection;
++            if (connection is null || !SqlConnection.ResetRetryEnabled || !connection.ResetRefusedOnLastRequest)
++            {
++                return false;
++            }
++            if (_transaction is not null || System.Transactions.Transaction.Current is not null)
++            {
++                // A replacement connection could not take over a transaction; fail as today.
++                connection.ClearResetRefused();
++                return false;
++            }
++            if (!connection.TryReplaceConnectionAfterRefusedReset())
++            {
++                return false;
++            }
++            // The first attempt's async bookkeeping refers to the replaced connection; the re-run
++            // sets it up again from scratch.
++            CachedAsyncState?.ResetAsyncState();
++            connection.AsyncCommandInProgress = false;
++            return true;
++        }
++
+         // @TODO: This method *needs* to be broken up into separate ones for each type of execution
+         private SqlDataReader RunExecuteReaderTds(
+             CommandBehavior cmdBehavior,
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
+index 92c2cb81d..5627f70a7 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
+@@ -2441,6 +2441,13 @@ namespace Microsoft.Data.SqlClient
+                                     break;
+                                 }
+                             }
++
++                            // PROTOTYPE (fix 2b): the server refused the pooled connection reset
++                            // and ran nothing. Replace the connection and re-run once.
++                            if (!shouldRetry && TryRecoverFromRefusedReset())
++                            {
++                                shouldRetry = true;
++                            }
+                         }
+ 
+                         if (!shouldRetry)
+@@ -2823,6 +2830,7 @@ namespace Microsoft.Data.SqlClient
+             // indicates that we should. So, try to read the result of the query before completing
+             // the overall task and trigger a retry if appropriate.
+             if ((IsColumnEncryptionEnabled && !isRetry && (usedCache || ShouldUseEnclaveBasedWorkflow))
++                || (SqlConnection.ResetRetryEnabled && !isRetry)   // PROTOTYPE (fix 2b): async re-run after a refused reset
+                 #if DEBUG
+                 || _forceInternalEndQuery
+                 #endif
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlConnection.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlConnection.cs
+index 23a5f5765..e95a74294 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlConnection.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlConnection.cs
+@@ -1314,6 +1314,68 @@ namespace Microsoft.Data.SqlClient
+             get => _reconnectCount;
+         }
+ 
++        // PROTOTYPE (fix 2b): transparent recovery when the server refuses to reset a pooled
++        // connection. The parser marks the connection when the first request after checkout is
++        // answered with 4021 before any reset acknowledgement; in that state the server has
++        // executed nothing, so the command replaces the physical connection and re-runs once.
++        internal static readonly bool ResetRetryEnabled =
++            Environment.GetEnvironmentVariable("SQLCLIENT_REPRO_RESET_RETRY") == "1";
++
++        internal bool ResetRefusedOnLastRequest { get; private set; }
++
++        internal void MarkResetRefused()
++        {
++            ResetRefusedOnLastRequest = true;
++            // The class-20 break that follows closes this connection; don't surface that state
++            // change to the user, as connection resiliency does during its reconnect.
++            _suppressStateChangeForReconnection = true;
++            SqlClientEventSource.Log.TryTraceEvent("SqlConnection.MarkResetRefused | Info | Object Id {0}, server refused the pooled connection reset.", ObjectID);
++        }
++
++        internal void ClearResetRefused()
++        {
++            if (ResetRefusedOnLastRequest)
++            {
++                ResetRefusedOnLastRequest = false;
++                _suppressStateChangeForReconnection = false;
++            }
++        }
++
++        // Replaces the inner connection after a refused reset. Returns false when nothing needs
++        // replacing or the replacement failed (the caller then rethrows the original error).
++        internal bool TryReplaceConnectionAfterRefusedReset()
++        {
++            if (!ResetRefusedOnLastRequest)
++            {
++                return false;
++            }
++            ResetRefusedOnLastRequest = false;
++            try
++            {
++                // The break has normally closed this connection already (OnError -> Close), in
++                // which case a plain open gets a fresh pooled connection; if it is still open,
++                // replace the doomed inner connection the way ReconnectAsync does.
++                bool stillOpen = State == ConnectionState.Open;
++                if (!stillOpen && State != ConnectionState.Closed)
++                {
++                    return false;
++                }
++                SqlClientEventSource.Log.TryTraceEvent("SqlConnection.TryReplaceConnectionAfterRefusedReset | Info | Object Id {0}, replacing connection (was {1}).", ObjectID, State);
++                TryOpen(null, forceNewConnection: stillOpen);
++                _reconnectCount = unchecked(_reconnectCount + 1);
++                return true;
++            }
++            catch (Exception e) when (ADP.IsCatchableExceptionType(e))
++            {
++                SqlClientEventSource.Log.TryTraceEvent("SqlConnection.TryReplaceConnectionAfterRefusedReset | Info | Object Id {0}, replacement failed: {1}", ObjectID, e.Message);
++                return false;
++            }
++            finally
++            {
++                _suppressStateChangeForReconnection = false;
++            }
++        }
++
+ #if NET
+         /// <include file='../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/OnStateChange/*' />
+         protected override void OnStateChange(StateChangeEventArgs stateChange)
+-- 
+2.55.0.windows.5
+
+
+From bc72ef5e6f58fdd9c7a56450f8857f10fdb77980 Mon Sep 17 00:00:00 2001
+From: kb <kb@dbi-it.dk>
+Date: Tue, 3 Nov 2026 23:53:16 +0100
+Subject: [PATCH 5/5] PROTOTYPE: fix 2b async path and test-suite breakage
+
+- The async re-run no longer goes through the Always Encrypted internal-end
+  path (which leaves _internalEndExecuteInitiated set when the end fails
+  without a retry and broke ExecuteXmlReaderAsync error semantics; 61 manual
+  retry-logic tests). It now catches in InternalEndExecuteReader, where the
+  4021 is observed, and re-runs synchronously after the first attempt's
+  cleanup.
+- Both re-run catches test only the marker in the exception filter and
+  replace the connection in the catch body, after inner finally blocks.
+- PostEarlyRead clears a leftover completed network packet task source
+  (Debug.Fail in ReadSni under the Debug test configuration).
+- Wire tracing removed from TdsParserStateObject.Multiplexer.cs, which the
+  functional test project compiles on its own.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../TdsParserStateObject.Multiplexer.cs       | 10 +----
+ .../SqlClient/Parser/TdsParserStateObject.cs  |  6 +++
+ .../Data/SqlClient/SqlCommand.Reader.cs       | 41 +++++++++++++++++--
+ .../Microsoft/Data/SqlClient/SqlCommand.cs    | 12 ++----
+ 4 files changed, 50 insertions(+), 19 deletions(-)
+
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
+index ae717a504..ab913d652 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.Multiplexer.cs
+@@ -15,12 +15,8 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+         public void ProcessSniPacket(PacketHandle packet, uint error)
+         {
+-            if (s_reproTrace)
+-            {
+-                uint sz = 0;
+-                uint ge = error == 0 && !IsPacketEmpty(packet) ? SniPacketGetData(packet, _inBuff, ref sz) : 0;
+-                ReproTrace($"ProcessSniPacket sniError={error} compat={LocalAppContextSwitches.UseCompatibilityProcessSni} getData={ge} dataSize={sz} type=0x{(sz > 0 ? _inBuff[0] : 0):X2} status=0x{(sz > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(sz > 8 ? _inBuff[8] : 0):X2}");
+-            }
++            // (Prototype wire tracing lives in TdsParserStateObject.cs; this file is also compiled
++            // on its own by the functional test project, so it must not reference those members.)
+             if (LocalAppContextSwitches.UseCompatibilityProcessSni)
+             {
+                 ProcessSniPacketCompat(packet, error);
+@@ -29,7 +25,6 @@ namespace Microsoft.Data.SqlClient.Parser
+ 
+             if (error != 0)
+             {
+-                ReproTrace($"read failed sniError={error} inBytesRead={_inBytesRead} inBytesUsed={_inBytesUsed} partial={(_partialPacket is null ? "none" : _partialPacket.CurrentLength.ToString())}");
+                 if ((_parser.State == TdsParserState.Closed) || (_parser.State == TdsParserState.Broken))
+                 {
+                     // Do nothing with callback if closed or broken and error not 0 - callback can occur
+@@ -66,7 +61,6 @@ namespace Microsoft.Data.SqlClient.Parser
+                     }
+                     getDataError = GetSniPacket(packet, ref dataSize);
+                 }
+-                ReproTrace($"packet received getDataError={getDataError} dataSize={dataSize} type=0x{(dataSize > 0 ? _inBuff[0] : 0):X2} status=0x{(dataSize > 1 ? _inBuff[1] : 0):X2} firstToken=0x{(dataSize > 8 ? _inBuff[8] : 0):X2}");
+ 
+                 if (getDataError == TdsEnums.SNI_SUCCESS)
+                 {
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+index 207ffade1..a9f7fdbf2 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/Parser/TdsParserStateObject.cs
+@@ -154,6 +154,12 @@ namespace Microsoft.Data.SqlClient.Parser
+             {
+                 return;
+             }
++            if (_networkPacketTaskSource?.Task.IsCompleted == true)
++            {
++                // Leftover from a finished async operation that kept its completed source
++                // (_asyncReadWithoutSnapshot); ReadSni asserts on it, so clear it first.
++                _networkPacketTaskSource = null;
++            }
+             _earlyReadPosted = true;
+             ReproTrace("posting early read right after the reset-carrying request was flushed");
+             _postingEarlyRead = true;   // the injected read delay simulates a slow reader, not this
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
+index abe775b00..0f94f7d20 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.Reader.cs
+@@ -1093,7 +1093,33 @@ namespace Microsoft.Data.SqlClient
+ 
+             CheckThrowSNIException();
+ 
+-            SqlDataReader reader = CompleteAsyncExecuteReader(isInternal, forDescribeParameterEncryption: false);
++            SqlDataReader reader;
++            try
++            {
++                reader = CompleteAsyncExecuteReader(isInternal, forDescribeParameterEncryption: false);
++            }
++            catch (SqlException) when (!isInternal && SqlConnection.ResetRetryEnabled && _activeConnection?.ResetRefusedOnLastRequest == true)
++            {
++                // PROTOTYPE (fix 2b), async: the server refused the pooled connection reset and ran
++                // nothing of the request. CompleteAsyncExecuteReader's finally has already cleaned
++                // up the first attempt. Replace the connection and run the command once more,
++                // synchronously here; a product version would re-issue it asynchronously.
++                if (!TryRecoverFromRefusedReset())
++                {
++                    throw;
++                }
++                return RunExecuteReader(
++                    _lastAsyncCommandBehavior,
++                    RunBehavior.ReturnImmediately,
++                    returnStream: true,
++                    completion: null,
++                    CommandTimeout,
++                    out _,
++                    out _,
++                    asyncWrite: false,
++                    isRetry: true,
++                    endMethod);
++            }
+             Debug.Assert(_stateObj is null, "non-null state object in InternalEndExecuteReader");
+             return reader;
+             // @TODO: CER Exception Handling was removed here (see GH#3581)
+@@ -1133,6 +1159,10 @@ namespace Microsoft.Data.SqlClient
+                 ValidateCommand(isAsync, method);
+                 _activeConnection?.ClearResetRefused();   // PROTOTYPE: a stale marker must not trigger a re-run
+             }
++            if (isAsync)
++            {
++                _lastAsyncCommandBehavior = cmdBehavior;   // PROTOTYPE (fix 2b)
++            }
+ 
+             // Only call after validate - requires non-null connection!
+             CheckNotificationStateAndAutoEnlist();
+@@ -1270,10 +1300,15 @@ namespace Microsoft.Data.SqlClient
+                         asyncWrite: asyncWrite && isAsync,
+                         isRetry);
+                 }
+-                catch (SqlException) when (!isRetry && !isAsync && TryRecoverFromRefusedReset())
++                catch (SqlException) when (!isRetry && !isAsync && SqlConnection.ResetRetryEnabled && _activeConnection?.ResetRefusedOnLastRequest == true)
+                 {
+                     // PROTOTYPE (fix 2b): the server refused the pooled connection reset and ran
+-                    // nothing; the connection has been replaced, so run the command once more.
++                    // nothing. Replace the connection (here, after the inner finally blocks have
++                    // run, not in the filter) and run the command once more.
++                    if (!TryRecoverFromRefusedReset())
++                    {
++                        throw;
++                    }
+                     return RunExecuteReader(
+                         cmdBehavior,
+                         runBehavior,
+diff --git a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
+index 5627f70a7..63be6a0bc 100644
+--- a/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
++++ b/src/Microsoft.Data.SqlClient/src/Microsoft/Data/SqlClient/SqlCommand.cs
+@@ -241,6 +241,10 @@ namespace Microsoft.Data.SqlClient
+         /// </summary>
+         private volatile bool _internalEndExecuteInitiated;
+ 
++        // PROTOTYPE (fix 2b): behavior of the last async reader execution, for the re-run in
++        // InternalEndExecuteReader.
++        private CommandBehavior _lastAsyncCommandBehavior;
++
+         private SqlNotificationRequest _notification;
+ 
+         #if NETFRAMEWORK
+@@ -2441,13 +2445,6 @@ namespace Microsoft.Data.SqlClient
+                                     break;
+                                 }
+                             }
+-
+-                            // PROTOTYPE (fix 2b): the server refused the pooled connection reset
+-                            // and ran nothing. Replace the connection and re-run once.
+-                            if (!shouldRetry && TryRecoverFromRefusedReset())
+-                            {
+-                                shouldRetry = true;
+-                            }
+                         }
+ 
+                         if (!shouldRetry)
+@@ -2830,7 +2827,6 @@ namespace Microsoft.Data.SqlClient
+             // indicates that we should. So, try to read the result of the query before completing
+             // the overall task and trigger a retry if appropriate.
+             if ((IsColumnEncryptionEnabled && !isRetry && (usedCache || ShouldUseEnclaveBasedWorkflow))
+-                || (SqlConnection.ResetRetryEnabled && !isRetry)   // PROTOTYPE (fix 2b): async re-run after a refused reset
+                 #if DEBUG
+                 || _forceInternalEndQuery
+                 #endif
+-- 
+2.55.0.windows.5
+
