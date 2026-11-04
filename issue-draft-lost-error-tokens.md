@@ -1,4 +1,6 @@
-# Draft issue for dotnet/SqlClient (not posted)
+# Draft issue for dotnet/SqlClient
+
+Filed as https://github.com/dotnet/SqlClient/issues/4994 (2026-11-04).
 
 Follows `.github/ISSUE_TEMPLATE/bug-report.md`. Suggested title:
 

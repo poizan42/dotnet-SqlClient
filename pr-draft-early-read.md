@@ -65,7 +65,7 @@ connection, which would also preserve the server's final tokens in other abortiv
 
 ## Issues
 
-Fixes #<lost-error-tokens issue, to be filed>.
+Fixes #4994.
 
 Related: #4969 (tokens that *were* received being discarded because another MARS session broke
 the parser first). The two stack: this change makes sure the tokens reach the process; #4969 is
