@@ -1,7 +1,7 @@
 # PR draft: dev/poizan42/early-read-on-connection-reset (not opened)
 
 Branch: https://github.com/poizan42/dotnet-SqlClient/tree/dev/poizan42/early-read-on-connection-reset
-(two commits on upstream `main` `c4441400b`: `38325d310` the fix, `4d654bc5b` the tests). Open with:
+(two commits on upstream `main` `c4441400b`: `fc2d0769f` the fix, `383e3c099` the tests). Open with:
 https://github.com/poizan42/dotnet-SqlClient/pull/new/dev/poizan42/early-read-on-connection-reset
 
 Suggested title: **Post the read before sending a request that carries the connection reset, so the server's error is not lost when it aborts the connection**
@@ -84,17 +84,25 @@ New simulated-server tests, `tests/UnitTests/SimulatedServerTests/EarlyReadOnCon
   the reset-connection flag with error tokens 4021, 18456 and 596 and then closes the client
   socket with an RST, the way SQL Server ends a killed session. The abort is a new
   `ITDSServerSession.AbortConnectionAfterResponse` flag acted on by `TDSServerParser` after the
-  response is written, with the socket close (linger 0) supplied by `TDSServerEndPointConnection`.
-- A new DEBUG-only seam `TdsParserStateObject.s_delayBeforeReadPostMilliseconds` delays posting a
-  read (except one posted ahead of a request), standing in for a cold reader.
-- `ExecuteScalar_ResetRefusedWithDelayedRead_ReportsServerError` and the `ExecuteScalarAsync`
-  variant: a pooled connection is reused with the reset pending and the read delayed by 100 ms;
-  the `SqlException` must carry the server's 4021 (and 596), not a transport error. Without the
-  early read both fail with "Expected: 4021, Actual: 10054" (verified by disabling the early
-  post); with it both pass.
-- `ExecuteScalar_PooledReuseWithDelayedRead_ReturnsResult` and the async variant: against a
-  server that accepts the reset, a pooled reuse with the early read still returns results for two
-  consecutive commands.
+  response is written, with the socket close (linger 0) supplied by `TDSServerEndPointConnection`;
+  `ConnectionAborted` lets a test sequence its next step after the abort.
+- A new DEBUG-only seam, `TdsParserStateObject.s_beforeReadPost`, runs before a read is posted on
+  demand (not for one posted ahead of a request). The tests use it to hold such a read back until
+  the server has aborted, standing in for a cold reader without relying on timing.
+- `ExecuteScalar_ResetRefusedAndReadHeldBack_ReportsServerError` and the `ExecuteScalarAsync`
+  variant: a pooled connection is reused with the reset pending and any read posted on demand held
+  back until the abort; the `SqlException` must carry the server's 4021 (and 596), not a
+  transport error. Without the early read both fail with "Expected: 4021, Actual: 10054"
+  (verified by disabling the early post); with it both pass.
+- `ExecuteScalar_PooledReuse_ReturnsResult` and the async variant: against a server that accepts
+  the reset, a pooled reuse with the early read still returns results for two consecutive
+  commands.
+
+Coding policies: the change was checked against `policy/coding-style.md` and
+`policy/coding-best-practices.md` (100-column lines, Allman braces, field naming and placement,
+no non-ASCII literals, no BOM on new files; the one `Task.Wait()` is justified in a comment and is
+the synchronous path's equivalent of the SNI's blocking read; the new path traces through
+`SqlClientEventSource`; the tests do not rely on timing).
 
 Existing suites on this branch, net10.0, Debug configuration:
 
