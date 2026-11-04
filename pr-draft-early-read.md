@@ -57,6 +57,13 @@ pay for the async read machinery (timer, task source, pinned callback) on that o
 No public API changes. No behaviour change when the server accepts the reset, other than the
 timing of the read.
 
+Limitation: an abortive close discards whatever is still queued in the kernel when it is
+processed, so a pending read only secures one read's worth of data (one packet). That is enough
+here because the refusal is a single packet (4021 + 18456 + 596 + DONE, about 600 bytes in every
+trace). A server that wrote several packets and then aborted would still lose the later ones
+whatever the client does; only a graceful close or a flush on the server side covers that. The
+same bound applies to an always-pending receive in the SNI layer.
+
 The managed SNI with MARS already behaves this way through its SMUX receive pump
 (`SniMarsConnection`, #4680) and does not lose the tokens; this change gives the other paths
 (native SNI with or without MARS, managed SNI without MARS) the same property at the parser level.
